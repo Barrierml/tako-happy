@@ -5,6 +5,7 @@ import { useRouter } from 'expo-router';
 import { Typography } from '@/constants/Typography';
 import { RoundButton } from '@/components/RoundButton';
 import { useConnectTerminal } from '@/hooks/useConnectTerminal';
+import { useAuth } from '@/auth/AuthContext';
 import { Ionicons } from '@expo/vector-icons';
 import { ItemList } from '@/components/ItemList';
 import { ItemGroup } from '@/components/ItemGroup';
@@ -13,6 +14,7 @@ import { t } from '@/text';
 
 export default function TerminalConnectScreen() {
     const router = useRouter();
+    const auth = useAuth();
     const [publicKey, setPublicKey] = useState<string | null>(null);
     const [hashProcessed, setHashProcessed] = useState(false);
     const { processAuthUrl, isLoading } = useConnectTerminal({
@@ -21,14 +23,39 @@ export default function TerminalConnectScreen() {
         }
     });
 
-    // Extract key from hash on web platform
+    // Extract key (and optional Tako `cred` ticket) from the URL hash on web.
+    // The Tako Switch desktop app builds `#key=<terminalKey>&cred=<ticket>`,
+    // where `ticket` is base64url(JSON {token, secret}) of the Tako-derived
+    // happy account. If present, we log the webapp in with it so the user never
+    // has to authenticate here — the Tako identity IS the happy identity.
     useEffect(() => {
         if (Platform.OS === 'web' && typeof window !== 'undefined' && !hashProcessed) {
             const hash = window.location.hash;
             if (hash.startsWith('#key=')) {
-                const key = hash.substring(5); // Remove '#key='
+                const params = new URLSearchParams(hash.substring(1)); // drop leading '#'
+                const key = params.get('key');
+                const cred = params.get('cred');
+
+                if (cred && !auth.isAuthenticated) {
+                    try {
+                        // base64url(no padding) JSON -> {token, secret}.
+                        // Restore url-safe chars and re-pad before atob (which
+                        // requires standard base64 with correct padding).
+                        let b64 = cred.replace(/-/g, '+').replace(/_/g, '/');
+                        const pad = b64.length % 4;
+                        if (pad === 2) b64 += '==';
+                        else if (pad === 3) b64 += '=';
+                        const json = atob(b64);
+                        const { token, secret } = JSON.parse(json) as { token: string; secret: string };
+                        if (token && secret) {
+                            void auth.login(token, secret);
+                        }
+                    } catch (e) {
+                        console.error('Failed to apply Tako cred ticket', e);
+                    }
+                }
+
                 setPublicKey(key);
-                
                 // Clear the hash from URL to prevent exposure in browser history
                 window.history.replaceState(null, '', window.location.pathname + window.location.search);
                 setHashProcessed(true);
@@ -36,7 +63,7 @@ export default function TerminalConnectScreen() {
                 setHashProcessed(true);
             }
         }
-    }, [hashProcessed]);
+    }, [hashProcessed, auth.isAuthenticated]);
 
     const handleConnect = async () => {
         if (publicKey) {

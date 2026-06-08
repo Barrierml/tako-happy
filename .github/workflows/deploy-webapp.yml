@@ -1,0 +1,79 @@
+name: deploy-webapp
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packages/happy-app/**"
+      - "packages/happy-wire/**"
+      - "Dockerfile.webapp"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag (leave empty for SHA-based)"
+        required: false
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login Aliyun Container Registry
+        run: |
+          printf '%s' '${{ secrets.ALIYUN_REGISTRY_PASSWORD }}' | docker login \
+            registry.cn-hongkong.aliyuncs.com \
+            -u '${{ secrets.ALIYUN_REGISTRY_USERNAME }}' \
+            --password-stdin
+
+      - name: Compute tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          IMAGE=registry.cn-hongkong.aliyuncs.com/shiroha/happy-webapp:${TAG}
+          docker buildx build \
+            --platform linux/amd64 \
+            -f Dockerfile.webapp \
+            --build-arg HAPPY_SERVER_URL=https://happy.shiroha.tech \
+            -t "${IMAGE}" \
+            --push .
+          echo "Pushed ${IMAGE}"
+
+      - name: Trigger deploy via n8n webhook
+        env:
+          WEBHOOK_URL: ${{ secrets.N8N_DEPLOY_WEBHOOK }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          HTTP_CODE=$(curl -sS -X POST "$WEBHOOK_URL" \
+            -H 'content-type: application/json' \
+            -d "{\"rep_id\":\"happy-webapp\",\"rep_url\":\"${TAG}\"}" \
+            -o /tmp/resp.json -w "%{http_code}" --max-time 30)
+          echo "n8n response: $(cat /tmp/resp.json) (HTTP $HTTP_CODE)"
+          jq -e '.ok == true' /tmp/resp.json > /dev/null
+
+      - name: Wait for health
+        run: |
+          for i in $(seq 1 30); do
+            CODE=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 5 \
+              https://happy-remote.shiroha.tech/ || echo 000)
+            if [ "$CODE" = "200" ]; then
+              echo "health 200 (round $i)"
+              exit 0
+            fi
+            sleep 4
+          done
+          echo "webapp health did not reach 200 within 2 min" >&2
+          exit 1
